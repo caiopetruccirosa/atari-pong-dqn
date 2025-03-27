@@ -274,9 +274,9 @@ def main():
     training_env = PongEnvironment()
     acc_reward_history = agent.train(
         env=training_env,
-        n_episodes=5000,
-        batch_size=64,
-        lr=1e-4,
+        n_episodes=3000,
+        batch_size=128,
+        lr=5e-4,
         gamma=0.99,
         epsilon_start=1.0,
         epsilon_end=0.01,
