@@ -1,5 +1,5 @@
 import gymnasium as gym
-from gymnasium.wrappers import RecordVideo
+from gymnasium.wrappers import RecordVideo, FrameStackObservation
 from gymnasium.core import ObsType
 
 import ale_py
@@ -20,24 +20,29 @@ from collections import deque
 # Pong Environment:
 #   - wraps Gymnasium/ALE environment for parsing action and state representations
 class PongEnvironment:
-    def __init__(self, render_mode=None, is_video_recording:bool=False, video_dir:str|None=None, video_filename:str|None=None):
-        gym_env = gym.make("ALE/Pong-v5", obs_type="ram", render_mode=render_mode, full_action_space=False)
+    def __init__(self, stacked_frames:int, render_mode:str|None=None, is_video_recording:bool=False, video_dir:str|None=None, video_filename:str|None=None):
+        gym_env = gym.make("ALE/Pong-v5", obs_type="ram", render_mode=render_mode, full_action_space=False, frameskip=stacked_frames)
+        gym_env = FrameStackObservation(gym_env, stack_size=stacked_frames)
         if not is_video_recording:
             self.env = gym_env
         else:
-            self.env = RecordVideo(gym_env.env, video_folder=video_dir, name_prefix=video_filename, episode_trigger=lambda _: True)
+            self.env = RecordVideo(gym_env, video_folder=video_dir, name_prefix=video_filename, episode_trigger=lambda _: True)
 
     def __parse_ram_state(self, ram_state: ObsType) -> np.ndarray:
         # indexes for values on RAM array found on:
         #   https://github.com/mila-iqia/atari-representation-learning/blob/master/atariari/benchmark/ram_annotations.py
-        state = np.array([
-            ram_state[51], # 'player_y' value
-            ram_state[50], # 'enemy_y' value
-            ram_state[49], # 'ball_x' value
-            ram_state[54], # 'ball_y' value
-            ram_state[13], # 'enemy_score' value
-            ram_state[14], # 'player_score' value
-        ], dtype=np.float32)
+        state = []
+        for frame in ram_state:
+            frame_state = [
+                frame[51], # 'player_y' value
+                frame[50], # 'enemy_y' value
+                frame[49], # 'ball_x' value
+                frame[54], # 'ball_y' value
+                frame[13], # 'enemy_score' value
+                frame[14], # 'player_score' value
+            ]
+            state += frame_state
+        state = np.array(state, dtype=np.float32)
         state = state / 255.0
         return state
     
@@ -73,8 +78,8 @@ class DQNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super(DQNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, 64)
-        self.fc2 = nn.Linear(64, 16)
-        self.fc3 = nn.Linear(16, action_dim)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, action_dim)
         self.relu = nn.ReLU()
     
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
@@ -116,7 +121,6 @@ class DDQNAgent:
         self.device = device
         
         self.epsilon = 0
-
         self.state_dim = state_dim
         self.action_dim = action_dim
 
@@ -128,7 +132,6 @@ class DDQNAgent:
             return random.randint(0, self.action_dim-1)
        
         state = torch.tensor(state, dtype=torch.float, device=self.device)
-        
         action_values = self.policy_network(state)
         choosen_action = action_values.argmax().item()
         
@@ -166,14 +169,14 @@ class DDQNAgent:
         # get q-value of next action selected by the policy network using target network
         # target_network provides stable q-value evaluation for next state-action pair
         # obs: uses gather() to select q-value for next action selected by policy network 
-        next_action_value = self.target_network(next_state_t).gather(1, next_action).squeeze(1).detach()
+        next_action_value = self.target_network(next_state_t).gather(1, next_action).squeeze(1)
 
         # calculate target q-value according to bellman optimality equation
         target_action_value = reward_t + (1 - finished_t) * gamma * next_action_value
         
         # compute loss between predicted q-values by the policy network and target q-values predicted by the target network for actions chosen by policy network
         # obs: uses detach() to prevent gradient from flowing through target network
-        loss = loss_func(current_action_value, target_action_value)
+        loss = loss_func(current_action_value, target_action_value.detach())
         
         optimizer.zero_grad()
         loss.backward()
@@ -205,10 +208,11 @@ class DDQNAgent:
 
         replay_buffer = ReplayBuffer(replay_buffer_capacity)
         acc_reward_history = []
-        
+
+        total_training_steps_count = 0
         for episode_idx in tqdm(range(n_episodes)):
             finished_current_ep = False
-            step = 0
+            episode_training_steps_count = 0
             acc_reward = 0
 
             state = env.reset()
@@ -224,9 +228,11 @@ class DDQNAgent:
                 acc_reward += reward
             
                 # copies policy network state to target network state
-                if step % update_target_network_after_n_steps == 0:
+                if total_training_steps_count % update_target_network_after_n_steps == 0:
                     self.target_network.load_state_dict(self.policy_network.state_dict())
-                step += 1
+
+                total_training_steps_count += 1
+                episode_training_steps_count += 1
 
             # updates epsilon according to decay until reaches its final value
             self.epsilon = max(self.epsilon*epsilon_decay, epsilon_end)
@@ -234,7 +240,7 @@ class DDQNAgent:
             acc_reward_history.append(acc_reward)
 
             if verbose:
-                print(f"[Episode {format_epsidode_idx(episode_idx)}] \t Reward: \t {acc_reward}, \t Steps: {step}, \t Epsilon: {self.epsilon:.2f}")
+                print(f"[Episode {format_epsidode_idx(episode_idx)}] \t Reward: \t {acc_reward}, \t Steps: {episode_training_steps_count}, \t Epsilon: {self.epsilon:.2f}")
 
         return acc_reward_history
     
@@ -264,11 +270,14 @@ def main():
     random.seed(42)
     torch.manual_seed(42)
 
-    # state representation will be an array of:
+    # state representation will be an array of (times the number of the stacked frames):
     #   [ player_y, enemy_y, ball_x, ball_y, enemy_score, player_score ]
+    stacked_frames = 4
+    frame_dim = 6
+    state_dim = frame_dim*stacked_frames
+    
     # action representation will be an array of:
     #   [ NOOP, LEFT, RIGHT ]
-    state_dim = 6
     action_dim = 3
 
     agent = DDQNAgent(
@@ -277,28 +286,28 @@ def main():
         device=torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     )
 
-    training_env = PongEnvironment()
+    training_env = PongEnvironment(stacked_frames)
     acc_reward_history = agent.train(
         env=training_env,
-        n_episodes=3000,
-        batch_size=128,
-        lr=5e-4,
+        n_episodes=1000,
+        batch_size=64,
+        lr=1e-4,
         gamma=0.99,
         epsilon_start=1.0,
         epsilon_end=0.01,
-        epsilon_decay=0.9995,
-        update_target_network_after_n_steps=500,
+        epsilon_decay=0.995,
+        update_target_network_after_n_steps=1500,
         replay_buffer_capacity=100000,
         verbose=True,
     )
     training_env.close()
 
-    with open('ddqn_agent_checkpoint.pkl', 'wb') as f:
+    with open('dqn_agent_checkpoint.pkl', 'wb') as f:
         pickle.dump(agent, f)
 
     ResultsReport.plot_accumulated_reward_history(acc_reward_history, 'Plot.jpg')
 
-    video_env = PongEnvironment(render_mode="rgb_array", is_video_recording=True, video_dir='.', video_filename='Video')
+    video_env = PongEnvironment(stacked_frames, render_mode="rgb_array", is_video_recording=True, video_dir='.', video_filename='Video')
     ResultsReport.record_agent_playing(video_env, agent)
     video_env.close()
 
