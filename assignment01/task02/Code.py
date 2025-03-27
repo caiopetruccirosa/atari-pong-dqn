@@ -3,6 +3,8 @@ from gymnasium.wrappers import RecordVideo
 from gymnasium.core import ObsType
 
 import ale_py
+import random
+import pickle 
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,10 +13,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-import random
-
 from tqdm import tqdm
-
 from collections import deque
 
 
@@ -109,10 +108,10 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-# Deep Q-Network Agent: 
+# Double Deep Q-Network Agent: 
 #   - chooses action based on state observation using policy network
-#   - trains the policy network of the agent in a pong environment using DQN learning with experience replay
-class DQNAgent:
+#   - trains the policy network of the agent in a pong environment using DDQN learning
+class DDQNAgent:
     def __init__(self, state_dim: int,  action_dim: int, device: torch.device):
         self.device = device
         
@@ -160,15 +159,21 @@ class DQNAgent:
         # obs: unsqueeze() just adds another dimension for gather operation and squeeze() removes dimension after operation
         current_action_value = self.policy_network(state_t).gather(1, action_t.unsqueeze(1)).squeeze()
 
-        # get maximum q-value for next state using target network
-        next_action_value = self.target_network(next_state_t).amax(dim=1)
+        # select the best action for next state using policy network
+        # obs: uses keepdim=True on argmax to maintain shape for gather operation
+        next_action = self.policy_network(next_state_t).argmax(dim=1, keepdim=True)
+        
+        # get q-value of next action selected by the policy network using target network
+        # target_network provides stable q-value evaluation for next state-action pair
+        # obs: uses gather() to select q-value for next action selected by policy network 
+        next_action_value = self.target_network(next_state_t).gather(1, next_action).squeeze(1).detach()
 
         # calculate target q-value according to bellman optimality equation
-        target_action_value = reward_t + (1-finished_t) * gamma * next_action_value
+        target_action_value = reward_t + (1 - finished_t) * gamma * next_action_value
         
-        # compute loss between predicted q-values by the policy network and target q-values based on target network
-        # obs: detach() prevents gradients from flowing through target network
-        loss = loss_func(current_action_value, target_action_value.detach())
+        # compute loss between predicted q-values by the policy network and target q-values predicted by the target network for actions chosen by policy network
+        # obs: uses detach() to prevent gradient from flowing through target network
+        loss = loss_func(current_action_value, target_action_value)
         
         optimizer.zero_grad()
         loss.backward()
@@ -243,7 +248,7 @@ class ResultsReport:
         plt.savefig(fig_path)
         plt.close()
 
-    def record_agent_playing(env: PongEnvironment, agent: DQNAgent):
+    def record_agent_playing(env: PongEnvironment, agent: DDQNAgent):
         state = env.reset()
         finished_current_ep = False
         while not finished_current_ep:
@@ -266,7 +271,7 @@ def main():
     state_dim = 6
     action_dim = 3
 
-    agent = DQNAgent(
+    agent = DDQNAgent(
         state_dim=state_dim,
         action_dim=action_dim,
         device=torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
@@ -282,15 +287,18 @@ def main():
         epsilon_start=1.0,
         epsilon_end=0.01,
         epsilon_decay=0.9995,
-        update_target_network_after_n_steps=1000,
+        update_target_network_after_n_steps=500,
         replay_buffer_capacity=100000,
         verbose=True,
     )
     training_env.close()
 
-    ResultsReport.plot_accumulated_reward_history(acc_reward_history, 'plot.jpg')
+    with open('ddqn_agent_checkpoint.pkl', 'wb') as f:
+        pickle.dump(agent, f)
 
-    video_env = PongEnvironment(render_mode="rgb_array", is_video_recording=True, video_dir='.', video_filename='video')
+    ResultsReport.plot_accumulated_reward_history(acc_reward_history, 'Plot.jpg')
+
+    video_env = PongEnvironment(render_mode="rgb_array", is_video_recording=True, video_dir='.', video_filename='Video')
     ResultsReport.record_agent_playing(video_env, agent)
     video_env.close()
 
