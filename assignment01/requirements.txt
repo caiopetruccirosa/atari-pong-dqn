@@ -1,0 +1,9 @@
+gymnasium[atari]
+gymnasium[other]
+ale-py
+numpy
+torch
+torchvision
+torchaudio
+matplotlib
+seaborn
