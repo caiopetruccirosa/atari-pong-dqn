@@ -188,6 +188,8 @@ class DQNAgent:
         replay_buffer_capacity: int,
         verbose:bool=False,
     ) -> list[float]:
+        print(f'Training agent with device {self.device}')
+
         format_epsidode_idx = lambda ep_idx: str(ep_idx).zfill(len(str(n_episodes)))
 
         optimizer = optim.Adam(self.policy_network.parameters(), lr=lr)
