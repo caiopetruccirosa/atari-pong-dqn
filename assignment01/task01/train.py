@@ -73,9 +73,9 @@ class PongEnvironment:
 class DQNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super(DQNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, action_dim)
+        self.fc1 = nn.Linear(state_dim, 64)
+        self.fc2 = nn.Linear(64, 16)
+        self.fc3 = nn.Linear(16, action_dim)
         self.relu = nn.ReLU()
     
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
