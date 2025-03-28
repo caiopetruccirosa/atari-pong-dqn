@@ -1,8 +1,6 @@
 import gymnasium as gym
 from gymnasium.wrappers import (
     RecordVideo, 
-    GrayscaleObservation, 
-    ResizeObservation, 
     FrameStackObservation,
 )
 
@@ -24,7 +22,7 @@ from tqdm import tqdm
 from collections import deque
 
 
-STATE_DIM = (4, 84, 84)
+STATE_DIM = 16
 ACTION_DIM = 3
 AGENT2ENV_ACTION = [0, 3, 2]
 
@@ -69,52 +67,20 @@ class ReplayBuffer:
 # --------------
 # Deep Q-Network
 # --------------
-# - follows original DQN paper architecture
+# - uses a MLP as architecture
 # - takes state observation and return actions values as a Q-function approximation
 class DQNetwork(nn.Module):
     def __init__(self):
         super(DQNetwork, self).__init__()
-
-        # model summary:
-        # - 1st layer (conv2d + relu; 4,112 params):
-        #   - input shape: [B, 4, 84, 84]
-        #   - output shape: [B, 16, 20, 20]
-        # - 2st layer (conv2d + relu; 8,224 params):
-        #   - input shape: [B, 16, 20, 20]
-        #   - output shape: [B, 32, 9, 9]
-        # - 3st layer (flatten):
-        #   - input shape: [B, 32, 9, 9]
-        #   - output shape: [B, 2592]
-        # - 4st layer (linear + relu; 663,808 params):
-        #   - input shape: [B, 2592]
-        #   - output shape: [B, 256]
-        # - 5st layer (linear; 771 params):
-        #   - input shape: [B, 256]
-        #   - output shape: [B, ACTION_DIM=3]
-        # total parameters: 676,915
-
-        self.conv1 = nn.Conv2d(
-            in_channels=4, 
-            out_channels=16, # applies 16 filters
-            kernel_size=8,
-            stride=4,
-        )
-        self.conv2 = nn.Conv2d(
-            in_channels=16, 
-            out_channels=32, # applies 32 filters
-            kernel_size=4,
-            stride=2,
-        )
-        self.fc1 = nn.Linear(in_features=2592, out_features=256)
-        self.fc2 = nn.Linear(in_features=256, out_features=ACTION_DIM)
+        self.fc1 = nn.Linear(in_features=STATE_DIM, out_features=128)
+        self.fc2 = nn.Linear(in_features=128, out_features=64)
+        self.fc3 = nn.Linear(in_features=64, out_features=ACTION_DIM)
         self.relu = nn.ReLU()
     
     def forward(self, x):
-        o = self.relu(self.conv1(x))
-        o = self.relu(self.conv2(o))
-        o = o.view(-1, self.fc1.in_features)
-        o = self.relu(self.fc1(o))
-        o = self.fc2(o)
+        o = self.relu(self.fc1(x))
+        o = self.relu(self.fc2(o))
+        o = self.fc3(o)
         return o
 
 
@@ -144,10 +110,10 @@ class DDQNAgent:
     def optimize_policy(self, optimizer, transitions_batch):
         states, actions, rewards, next_states, dones = transitions_batch
 
-        states = states.to(self.device) # shape (B, 4, 84, 84)
+        states = states.to(self.device) # shape (B, 16)
         actions = actions.to(self.device) # shape (B)
         rewards = rewards.to(self.device) # shape (B)
-        next_states = next_states.to(self.device) # shape (B, 4, 84, 84)
+        next_states = next_states.to(self.device) # shape (B, 16)
         dones = dones.to(self.device) # shape (B)
         
         # predicts Q-values for all actions for current state (batched); result of shape (B, ACTION_DIM=3)
@@ -210,7 +176,7 @@ def train_agent(
         ep_reward = 0
 
         state, _ = env.reset()
-        state = crop_state_playing_area(state)
+        state = preprocess_state(state)
         while not done and not STOP_TRAINING:
             if step < NUM_RANDOM_POLICY_STEPS:
                 action = random.randint(0, ACTION_DIM-1)
@@ -219,7 +185,7 @@ def train_agent(
             env_action = AGENT2ENV_ACTION[action]
 
             next_state, reward, terminated, truncated, _ = env.step(env_action)
-            next_state = crop_state_playing_area(next_state)
+            next_state = preprocess_state(next_state)
 
             done = terminated or truncated
             replay_buffer.push(
@@ -269,20 +235,32 @@ def train_agent(
 #   - actions: 0 -> 0 (NOOP); 1 -> 3 (LEFT); 2 -> 2 (RIGHT)
 parse_agent_action = lambda agent_agent: AGENT2ENV_ACTION[agent_agent]
 
-crop_state_playing_area = lambda state: state[:, 18:-8, :]
-
-normalize_state = lambda state: state / 255.0
-
 format_step_idx = lambda step_idx: str(step_idx).zfill(len(str(NUM_TRAINING_STEPS)))
+
+def preprocess_state(state):
+    # indexes for values on RAM array found on:
+    #   https://github.com/mila-iqia/atari-representation-learning/blob/master/atariari/benchmark/ram_annotations.py
+    new_state = []
+    for frame in state:
+        frame_state = [
+            frame[51], # 'player_y' value
+            frame[50], # 'enemy_y' value
+            frame[49], # 'ball_x' value
+            frame[54], # 'ball_y' value
+        ]
+        new_state += frame_state
+    new_state = np.array(new_state, dtype=np.float32)
+    new_state = new_state / 255.0
+    return new_state
 
 def preprocess_transitions(transitions_batch):
     states, actions, rewards, next_states, dones = zip(*transitions_batch)
 
     # states and next states:
-    # - from list[np.ndarray[np.uint8]] of shape (B, 4, 84, 84)
-    # - to normalized torch.tensor[torch.tensor[torch.float32]] of shape (B, 4, 84, 84)
-    states = torch.tensor(normalize_state(np.array(states, dtype=np.float32)), dtype=torch.float32)
-    next_states = torch.tensor(normalize_state(np.array(next_states, dtype=np.float32)), dtype=torch.float32)
+    # - from list[np.ndarray[np.float32]] of shape (B, 4)
+    # - to normalized torch.tensor[torch.tensor[torch.float32]] of shape (B, 4)
+    states = torch.tensor(np.array(states), dtype=torch.float32)
+    next_states = torch.tensor(np.array(next_states), dtype=torch.float32)
 
     # rewards:
     # - from from list[float] of shape (B) 
@@ -303,9 +281,7 @@ def preprocess_transitions(transitions_batch):
 
 def make_environment(render_mode=None):
     stacked_frames = 4
-    env = gym.make("ALE/Pong-v5", render_mode=render_mode, full_action_space=False, frameskip=stacked_frames)
-    env = GrayscaleObservation(env)
-    env = ResizeObservation(env, (110, 84))
+    env = gym.make("ALE/Pong-v5", obs_type="ram", render_mode=render_mode, full_action_space=False, frameskip=stacked_frames)
     env = FrameStackObservation(env, stack_size=stacked_frames)
     return env
 
@@ -319,7 +295,7 @@ def plot_history(history, attribute, title, xlabel, ylabel, fig_path):
 
 def record_agent_playing(agent, env):
     state, _ = env.reset()
-    state = crop_state_playing_area(state)
+    state = preprocess_state(state)
 
     done = False
     while not done:
@@ -329,7 +305,7 @@ def record_agent_playing(agent, env):
         next_state, _, terminated, truncated, _ = env.step(env_action)
         
         done = terminated or truncated
-        state = crop_state_playing_area(next_state)
+        state = preprocess_state(next_state)
 
 def stop_training(signal, frame):
     global STOP_TRAINING
