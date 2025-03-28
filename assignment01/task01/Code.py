@@ -30,7 +30,7 @@ AGENT2ENV_ACTION = [0, 3, 2]
 
 EPSILON_START = 1
 EPSILON_END = 0.1
-NUM_EPSILON_DECAY_STEPS = 1000000
+NUM_EPSILON_DECAY_STEPS = 500000
 
 BATCH_SIZE = 32
 LR = 2.5e-5
@@ -42,7 +42,7 @@ UPDATE_TARGET_FREQUENCY = 10000
 REPLAY_BUFFER_CAPACITY = 1000000
 
 NUM_RANDOM_POLICY_STEPS = 50000
-NUM_TRAINING_STEPS = 10000000
+NUM_TRAINING_STEPS = 5000000
 
 VERBOSE_STEP_FREQUENCY = 10000
 
@@ -154,7 +154,7 @@ class DQNAgent:
         q_values = self.policy_network(states)
 
         # selects Q-values predicted for action taken (batched); result of shape (B)
-        q_value_action_taken = torch.gather(input=q_values, dim=1, index=actions.unsqueeze(dim=1)).squeeze(dim=1)
+        q_value_action_taken = q_values.gather(dim=1, index=actions.unsqueeze(dim=1)).squeeze(dim=1)
 
         # predicts Q*-values for all actions in the next states (batched) using the target network; results of shape (B, ACTION_DIM=3)
         next_qs_values = self.target_network(next_states)
@@ -165,7 +165,7 @@ class DQNAgent:
         # calculate Q*-value for action taken in current state (batched) according to bellman optimality equation; result of shape (B)
         qs_value_action_taken = rewards + (1-dones) * GAMMA * best_next_qs_value
         
-        # compute loss between predicted q-values by the policy network and target q-values based on target network
+        # compute loss between Q-value predicted by the policy network and Q*-value (based on target network) for action taken in current state
         # obs: detach() prevents gradients from flowing through target network
         loss = F.mse_loss(q_value_action_taken, qs_value_action_taken.detach())
         
@@ -178,7 +178,7 @@ class DQNAgent:
 # Training loop
 # -------------
 def train_agent(
-    agent: DQNAgent,
+    agent,
     env,
     verbose=False,
 ):
