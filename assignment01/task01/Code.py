@@ -1,10 +1,15 @@
 import gymnasium as gym
-from gymnasium.wrappers import RecordVideo, FrameStackObservation
-from gymnasium.core import ObsType
+from gymnasium.wrappers import (
+    RecordVideo, 
+    GrayscaleObservation, 
+    ResizeObservation, 
+    FrameStackObservation,
+)
 
 import ale_py
 import random
-import pickle 
+import pickle
+import signal 
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,298 +17,361 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from collections import deque
 
 
-# Pong Environment:
-#   - wraps Gymnasium/ALE environment for parsing action and state representations
-class PongEnvironment:
-    def __init__(self, stacked_frames:int, render_mode:str|None=None, is_video_recording:bool=False, video_dir:str|None=None, video_filename:str|None=None):
-        gym_env = gym.make("ALE/Pong-v5", obs_type="ram", render_mode=render_mode, full_action_space=False, frameskip=stacked_frames)
-        gym_env = FrameStackObservation(gym_env, stack_size=stacked_frames)
-        if not is_video_recording:
-            self.env = gym_env
-        else:
-            self.env = RecordVideo(gym_env, video_folder=video_dir, name_prefix=video_filename, episode_trigger=lambda _: True)
+STATE_DIM = (4, 84, 84)
+ACTION_DIM = 3
+AGENT2ENV_ACTION = [0, 3, 2]
 
-    def __parse_ram_state(self, ram_state: ObsType) -> np.ndarray:
-        # indexes for values on RAM array found on:
-        #   https://github.com/mila-iqia/atari-representation-learning/blob/master/atariari/benchmark/ram_annotations.py
-        state = []
-        for frame in ram_state:
-            frame_state = [
-                frame[51], # 'player_y' value
-                frame[50], # 'enemy_y' value
-                frame[49], # 'ball_x' value
-                frame[54], # 'ball_y' value
-                frame[13], # 'enemy_score' value
-                frame[14], # 'player_score' value
-            ]
-            state += frame_state
-        state = np.array(state, dtype=np.float32)
-        state = state / 255.0
-        return state
-    
-    def __parse_agent_action(self, agent_action: int) -> int:
-        # maps agent action representation to environment action representation:
-        #   0 -> 0 (NOOP), 1 -> 3 (LEFT), 2 -> 2 (RIGHT)
-        agent2env_action = [0, 3, 2]
-        return agent2env_action[agent_action]
+EPSILON_START = 1
+EPSILON_END = 0.1
+NUM_EPSILON_DECAY_STEPS = 1000000
 
-    def reset(self) -> np.ndarray:
-        state, _ = self.env.reset()
-        state = self.__parse_ram_state(state)
-        return state
+BATCH_SIZE = 32
+LR = 2.5e-5
+GAMMA = 0.99
 
-    def step(self, agent_action: int) -> tuple[np.ndarray, float, bool]:
-        action = self.__parse_agent_action(agent_action)
-        
-        next_state, reward, terminated, truncated, _ = self.env.step(action)
+UPDATE_POLICY_FREQUENCY = 4
+UPDATE_TARGET_FREQUENCY = 10000
 
-        next_state = self.__parse_ram_state(next_state)
-        finished = int(terminated or truncated)
+REPLAY_BUFFER_CAPACITY = 1000000
 
-        return (next_state, reward, finished)
-    
-    def close(self):
-        self.env.close()
+NUM_RANDOM_POLICY_STEPS = 50000
+NUM_TRAINING_STEPS = 10000000
+
+VERBOSE_STEP_FREQUENCY = 10000
+
+STOP_TRAINING = False
 
 
-# Deep Q-Network:
-#   - implementation of a simple MLP network
-#   - takes state observation and return actions values as a Q-function approximation
-class DQNetwork(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
-        super(DQNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, action_dim)
-        self.relu = nn.ReLU()
-    
-    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        o = self.relu(self.fc1(x))
-        o = self.relu(self.fc2(o))
-        o = self.fc3(o)
-        return o
-
-
-# Replay Buffer:
-#   - stores a circular buffer, using a deque, of environment transitions and their rewards
+# -------------
+# Replay Buffer
+# -------------
 class ReplayBuffer:
-    def __init__(self, buffer_capacity: int):
-        self.buffer_capacity = buffer_capacity
-        self.buffer = deque(maxlen=buffer_capacity)
-    
-    def push(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, finished: int):
-        self.buffer.append((state, action, reward, next_state, finished))
-    
-    def sample_batch(self, batch_size: int) -> tuple[list[np.ndarray], list[int], list[float], list[np.ndarray], list[int]]:
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, finished = zip(*batch)
-        state = torch.tensor(np.array(state), dtype=torch.float)
-        action = torch.tensor(np.array(action), dtype=torch.long)
-        reward = torch.tensor(np.array(reward), dtype=torch.float)
-        next_state = torch.tensor(np.array(next_state), dtype=torch.float)
-        finished = torch.tensor(np.array(finished), dtype=torch.float)
-        return state, action, reward, next_state, finished
-    
-    def __len__(self) -> int:
+    def __init__(self):
+        self.buffer = deque([], maxlen=REPLAY_BUFFER_CAPACITY)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, sample_size):
+        return random.sample(self.buffer, sample_size)
+
+    def __len__(self):
         return len(self.buffer)
 
 
-# Deep Q-Network Agent: 
-#   - chooses action based on state observation using policy network
-#   - trains the policy network of the agent in a pong environment using DQN learning with experience replay
+# --------------
+# Deep Q-Network
+# --------------
+# - follows original DQN paper architecture
+# - takes state observation and return actions values as a Q-function approximation
+class DQNetwork(nn.Module):
+    def __init__(self):
+        super(DQNetwork, self).__init__()
+
+        # model summary:
+        # - 1st layer (conv2d + relu; 4,112 params):
+        #   - input shape: [B, 4, 84, 84]
+        #   - output shape: [B, 16, 20, 20]
+        # - 2st layer (conv2d + relu; 8,224 params):
+        #   - input shape: [B, 16, 20, 20]
+        #   - output shape: [B, 32, 9, 9]
+        # - 3st layer (flatten):
+        #   - input shape: [B, 32, 9, 9]
+        #   - output shape: [B, 2592]
+        # - 4st layer (linear + relu; 663,808 params):
+        #   - input shape: [B, 2592]
+        #   - output shape: [B, 256]
+        # - 5st layer (linear; 771 params):
+        #   - input shape: [B, 256]
+        #   - output shape: [B, ACTION_DIM=3]
+        # total parameters: 676,915
+
+        self.conv1 = nn.Conv2d(
+            in_channels=4, 
+            out_channels=16, # applies 16 filters
+            kernel_size=8,
+            stride=4,
+        )
+        self.conv2 = nn.Conv2d(
+            in_channels=16, 
+            out_channels=32, # applies 32 filters
+            kernel_size=4,
+            stride=2,
+        )
+        self.fc1 = nn.Linear(in_features=2592, out_features=256)
+        self.fc2 = nn.Linear(in_features=256, out_features=ACTION_DIM)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        o = self.relu(self.conv1(x))
+        o = self.relu(self.conv2(o))
+        o = o.view(-1, self.fc1.in_features)
+        o = self.relu(self.fc1(o))
+        o = self.fc2(o)
+        return o
+
+
+# ---------
+# DQN Agent
+# ---------
 class DQNAgent:
-    def __init__(self, state_dim: int,  action_dim: int, device: torch.device):
+    def __init__(self, device):
         self.device = device
-        
-        self.epsilon = 0
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+        self.policy_network = DQNetwork().to(self.device)
+        self.target_network = DQNetwork().to(self.device)
 
-        self.policy_network = DQNetwork(self.state_dim, self.action_dim).to(self.device)
-        self.target_network = DQNetwork(self.state_dim, self.action_dim).to(self.device)
+    def update_target_network(self):
+        self.target_network.load_state_dict(self.policy_network.state_dict())
 
-    def choose_action(self, state: np.ndarray) -> int:
-        if random.random() < self.epsilon:
-            return random.randint(0, self.action_dim-1)
+    def choose_action(self, state, epsilon):
+        if random.random() < epsilon:
+            return random.randint(0, ACTION_DIM-1)
        
-        state = torch.tensor(state, dtype=torch.float, device=self.device)
-        action_values = self.policy_network(state)
-        choosen_action = action_values.argmax().item()
+        state = torch.tensor(state, dtype=torch.float32, device=self.device)
+
+        q_action_values = self.policy_network(state)
+        choosen_action = q_action_values.argmax().item()
         
         return choosen_action
+    
+    def optimize_policy(self, optimizer, transitions_batch):
+        states, actions, rewards, next_states, dones = transitions_batch
 
-    def optimize_policy(
-        self,
-        optimizer: optim.Optimizer,
-        replay_buffer: ReplayBuffer,
-        batch_size: int,
-        gamma: float,
-    ):
-        if len(replay_buffer) < batch_size:
-            return
+        states = states.to(self.device) # shape (B, 4, 84, 84)
+        actions = actions.to(self.device) # shape (B)
+        rewards = rewards.to(self.device) # shape (B)
+        next_states = next_states.to(self.device) # shape (B, 4, 84, 84)
+        dones = dones.to(self.device) # shape (B)
         
-        loss_func = nn.MSELoss()
-        
-        state_t, action_t, reward_t, next_state_t, finished_t = replay_buffer.sample_batch(batch_size)
-        state_t = state_t.to(self.device)
-        action_t = action_t.to(self.device)
-        reward_t = reward_t.to(self.device)
-        next_state_t = next_state_t.to(self.device)
-        finished_t = finished_t.to(self.device)
-        
-        # select q-value for the action taken in the current state:
-        #   policy_network predicts q-value for all possible actions,
-        #   and gather() selects the q-value predicted for the action taken
-        # obs: unsqueeze() just adds another dimension for gather operation and squeeze() removes dimension after operation
-        current_action_value = self.policy_network(state_t).gather(1, action_t.unsqueeze(1)).squeeze()
+        # predicts Q-values for all actions for current state (batched); result of shape (B, ACTION_DIM=3)
+        q_values = self.policy_network(states)
 
-        # get maximum q-value for next state using target network
-        next_action_value = self.target_network(next_state_t).amax(dim=1)
+        # selects Q-values predicted for action taken (batched); result of shape (B)
+        q_value_action_taken = torch.gather(input=q_values, dim=1, index=actions.unsqueeze(dim=1)).squeeze(dim=1)
 
-        # calculate target q-value according to bellman optimality equation
-        target_action_value = reward_t + (1-finished_t) * gamma * next_action_value
+        # predicts Q*-values for all actions in the next states (batched) using the target network; results of shape (B, ACTION_DIM=3)
+        next_qs_values = self.target_network(next_states)
+
+        # gets best Q*-value in the next state (batched); result of shape (B)
+        best_next_qs_value, _ = next_qs_values.max(dim=1)
+
+        # calculate Q*-value for action taken in current state (batched) according to bellman optimality equation; result of shape (B)
+        qs_value_action_taken = rewards + (1-dones) * GAMMA * best_next_qs_value
         
         # compute loss between predicted q-values by the policy network and target q-values based on target network
         # obs: detach() prevents gradients from flowing through target network
-        loss = loss_func(current_action_value, target_action_value.detach())
+        loss = F.mse_loss(q_value_action_taken, qs_value_action_taken.detach())
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    def train(
-        self, 
-        env: PongEnvironment, 
-        n_episodes: int, 
-        batch_size: int, 
-        lr: float, 
-        gamma: float, 
-        epsilon_start: float, 
-        epsilon_end: float, 
-        epsilon_decay: float,
-        update_target_network_after_n_steps: int, 
-        replay_buffer_capacity: int,
-        verbose:bool=False,
-    ) -> list[float]:
-        print(f'Training agent with device {self.device}')
 
-        format_epsidode_idx = lambda ep_idx: str(ep_idx).zfill(len(str(n_episodes)))
+# -------------
+# Training loop
+# -------------
+def train_agent(
+    agent: DQNAgent,
+    env,
+    verbose=False,
+):
+    print(f'Training agent on device \'{agent.device}\'.')
 
-        optimizer = optim.Adam(self.policy_network.parameters(), lr=lr)
+    replay_buffer = ReplayBuffer()
+    optimizer = optim.Adam(agent.policy_network.parameters(), lr=LR)
+    epsilon = EPSILON_START
 
-        # initializes target network to current policy network and epsilon for training
-        self.target_network.load_state_dict(self.policy_network.state_dict())
-        self.epsilon = epsilon_start
+    agent.update_target_network()
 
-        replay_buffer = ReplayBuffer(replay_buffer_capacity)
-        acc_reward_history = []
+    history = {
+        'steps_per_episode': [],
+        'reward_per_episode': [],
+    }
 
-        total_training_steps_count = 0
-        for episode_idx in tqdm(range(n_episodes)):
-            finished_current_ep = False
-            episode_training_steps_count = 0
-            acc_reward = 0
+    pbar = tqdm(total=NUM_TRAINING_STEPS)
 
-            state = env.reset()
-            while not finished_current_ep:
-                action = self.choose_action(state)
-                next_state, reward, finished_current_ep = env.step(action)
+    step = 0
+    while step < NUM_TRAINING_STEPS and not STOP_TRAINING:
+        done = False
+        ep_step_count = 0
+        ep_reward = 0
+
+        state, _ = env.reset()
+        state = crop_state_playing_area(state)
+        while not done and not STOP_TRAINING:
+            if step < NUM_RANDOM_POLICY_STEPS:
+                action = random.randint(0, ACTION_DIM-1)
+            else:
+                action = agent.choose_action(state, epsilon)
+            env_action = AGENT2ENV_ACTION[action]
+
+            next_state, reward, terminated, truncated, _ = env.step(env_action)
+            next_state = crop_state_playing_area(next_state)
+
+            done = terminated or truncated
+            replay_buffer.push(
+                state=state,
+                action=action, 
+                reward=reward, 
+                next_state=next_state,
+                done=done,
+            )
+
+            # updates policy network based on experience replay from replay buffer
+            if step % UPDATE_POLICY_FREQUENCY == 0 and len(replay_buffer) >= BATCH_SIZE:
+                transitions_batch = preprocess_transitions(replay_buffer.sample(BATCH_SIZE))
+                agent.optimize_policy(optimizer, transitions_batch)
                 
-                replay_buffer.push(state, action, reward, next_state, finished_current_ep)
-                
-                self.optimize_policy(optimizer, replay_buffer, batch_size, gamma)
+            # copies policy network state to target network state
+            if step % UPDATE_TARGET_FREQUENCY == 0:
+                agent.update_target_network()
 
-                state = next_state
-                acc_reward += reward
-            
-                # copies policy network state to target network state
-                if total_training_steps_count % update_target_network_after_n_steps == 0:
-                    self.target_network.load_state_dict(self.policy_network.state_dict())
+            # linear annealing of epsilon, similar to original paper
+            if step >= NUM_RANDOM_POLICY_STEPS:
+                epsilon = max(EPSILON_START - (EPSILON_START-EPSILON_END)*step/NUM_TRAINING_STEPS, EPSILON_END)
 
-                total_training_steps_count += 1
-                episode_training_steps_count += 1
-
-            if verbose:
-                print(f"[Episode {format_epsidode_idx(episode_idx)}] \t Reward: \t {acc_reward}, \t Steps: {episode_training_steps_count}, \t Epsilon: {self.epsilon:.2f}")
-
-            # updates epsilon according to decay until reaches its final value
-            self.epsilon = max(self.epsilon*epsilon_decay, epsilon_end)
-            acc_reward_history.append(acc_reward)
-
-        return acc_reward_history
-    
-
-class ResultsReport:
-    def plot_accumulated_reward_history(acc_reward_history: list[float], fig_path: str):
-        plt.plot(acc_reward_history)
-        plt.title('Accumulated Reward History for DQN Agent')
-        plt.xlabel('Episodes Played')
-        plt.ylabel('Total Accumulated Reward')
-        plt.savefig(fig_path)
-        plt.close()
-
-    def record_agent_playing(env: PongEnvironment, agent: DQNAgent):
-        state = env.reset()
-        finished_current_ep = False
-        while not finished_current_ep:
-            action = agent.choose_action(state)
-            next_state, _, finished_current_ep = env.step(action)
+            step += 1
+            ep_step_count += 1
+            ep_reward += reward
             state = next_state
-        env.close()
+
+            if step < NUM_TRAINING_STEPS:
+                pbar.update()
+
+        if verbose:
+            print(f"[Step {format_step_idx(step)} / {NUM_TRAINING_STEPS}] \t Episode Reward: \t {ep_reward}, \t Episode Steps: {ep_step_count}, \t Epsilon: {epsilon:.2f}")
+
+        if done:
+            history['steps_per_episode'].append(ep_step_count)
+            history['reward_per_episode'].append(ep_reward)
+
+    return agent, history
 
 
-def main():
-    gym.register_envs(ale_py)
+# -------------------
+# Auxiliary functions
+# -------------------
+
+# maps agent action representation to environment action representation:
+#   - actions: 0 -> 0 (NOOP); 1 -> 3 (LEFT); 2 -> 2 (RIGHT)
+parse_agent_action = lambda agent_agent: AGENT2ENV_ACTION[agent_agent]
+
+crop_state_playing_area = lambda state: state[:, 18:-8, :]
+
+normalize_state = lambda state: state / 255.0
+
+format_step_idx = lambda step_idx: str(step_idx).zfill(len(str(NUM_TRAINING_STEPS)))
+
+def preprocess_transitions(transitions_batch):
+    states, actions, rewards, next_states, dones = zip(*transitions_batch)
+
+    # states and next states:
+    # - from list[np.ndarray[np.uint8]] of shape (B, 4, 84, 84)
+    # - to normalized torch.tensor[torch.tensor[torch.float32]] of shape (B, 4, 84, 84)
+    states = torch.tensor(normalize_state(np.array(states, dtype=np.float32)), dtype=torch.float32)
+    next_states = torch.tensor(normalize_state(np.array(next_states, dtype=np.float32)), dtype=torch.float32)
+
+    # rewards:
+    # - from from list[float] of shape (B) 
+    # - to clipped value torch.tensor[torch.int8] of shape (B)
+    rewards = torch.tensor(np.sign(np.array(rewards)), dtype=torch.int8)
+
+    # actions:
+    # - from from list[int] of shape (B) 
+    # - to torch.tensor[torch.long] of shape (B)
+    actions = torch.tensor(np.array(actions), dtype=torch.long)
     
+    # dones:
+    # - from from list[bool] of shape (B) 
+    # - to torch.tensor[torch.float32] of shape (B)
+    dones = torch.tensor(np.array(dones), dtype=torch.float32)
+
+    return (states, actions, rewards, next_states, dones)
+
+def make_environment(render_mode=None):
+    stacked_frames = 4
+    env = gym.make("ALE/Pong-v5", render_mode=render_mode, full_action_space=False, frameskip=stacked_frames)
+    env = GrayscaleObservation(env)
+    env = ResizeObservation(env, (110, 84))
+    env = FrameStackObservation(env, stack_size=stacked_frames)
+    return env
+
+def plot_history(history, attribute, title, xlabel, ylabel, fig_path):
+    plt.plot(history[attribute])
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.savefig(fig_path)
+    plt.close()
+
+def record_agent_playing(agent, env):
+    state, _ = env.reset()
+    state = crop_state_playing_area(state)
+
+    done = False
+    while not done:
+        action = agent.choose_action(state, epsilon=0.05)
+        env_action = AGENT2ENV_ACTION[action]
+
+        next_state, _, terminated, truncated, _ = env.step(env_action)
+        
+        done = terminated or truncated
+        state = crop_state_playing_area(next_state)
+
+def stop_training(signal, frame):
+    global STOP_TRAINING
+    STOP_TRAINING = True
+
+
+# ----
+# Main
+# ----
+def main():
     random.seed(42)
     torch.manual_seed(42)
 
-    # state representation will be an array of (times the number of the stacked frames):
-    #   [ player_y, enemy_y, ball_x, ball_y, enemy_score, player_score ]
-    stacked_frames = 4
-    frame_dim = 6
-    state_dim = frame_dim*stacked_frames
-    
-    # action representation will be an array of:
-    #   [ NOOP, LEFT, RIGHT ]
-    action_dim = 3
+    gym.register_envs(ale_py)
 
-    agent = DQNAgent(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        device=torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-    )
+    signal.signal(signal.SIGINT, stop_training)
 
-    training_env = PongEnvironment(stacked_frames)
-    acc_reward_history = agent.train(
-        env=training_env,
-        n_episodes=1000,
-        batch_size=64,
-        lr=1e-4,
-        gamma=0.99,
-        epsilon_start=1.0,
-        epsilon_end=0.01,
-        epsilon_decay=0.995,
-        update_target_network_after_n_steps=1500,
-        replay_buffer_capacity=100000,
-        verbose=True,
-    )
-    training_env.close()
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    agent = DQNAgent(device)
+
+    env = make_environment()
+    agent, training_history = train_agent(agent, env, verbose=True)
+    env.close()
 
     with open('dqn_agent_checkpoint.pkl', 'wb') as f:
         pickle.dump(agent, f)
 
-    ResultsReport.plot_accumulated_reward_history(acc_reward_history, 'Plot.jpg')
+    plot_history(
+        history=training_history, 
+        attribute='reward_per_episode',
+        title='History of Reward per Episode for DQN Agent', 
+        xlabel='Episodes Played', 
+        ylabel='Reward', 
+        fig_path='reward_per_ep_plot.jpg',
+    )
 
-    video_env = PongEnvironment(stacked_frames, render_mode="rgb_array", is_video_recording=True, video_dir='.', video_filename='Video')
-    ResultsReport.record_agent_playing(video_env, agent)
+    plot_history(
+        history=training_history, 
+        attribute='steps_per_episode',
+        title='History of Steps per Episode for DQN Agent', 
+        xlabel='Episodes Played', 
+        ylabel='Number of Steps', 
+        fig_path='steps_per_ep_plot.jpg',
+    )
+
+    video_env = make_environment(render_mode="rgb_array")
+    video_env = RecordVideo(video_env, video_folder='.', name_prefix='Video', episode_trigger=lambda _: True)
+    record_agent_playing(agent, video_env)
     video_env.close()
-
 
 if __name__ == "__main__":
     main()
