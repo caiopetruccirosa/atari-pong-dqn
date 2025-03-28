@@ -207,7 +207,9 @@ def train_agent(
 
             # linear annealing of epsilon, similar to original paper
             if step >= NUM_RANDOM_POLICY_STEPS:
-                epsilon = max(EPSILON_START - (EPSILON_START-EPSILON_END)*step/NUM_TRAINING_STEPS, EPSILON_END)
+                decaying_steps = step-NUM_RANDOM_POLICY_STEPS
+                epsilon_decay_offset = (EPSILON_START-EPSILON_END)*(decaying_steps/NUM_EPSILON_DECAY_STEPS)
+                epsilon = max(EPSILON_START-epsilon_decay_offset, EPSILON_END)
 
             step += 1
             ep_step_count += 1
