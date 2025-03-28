@@ -32,8 +32,8 @@ EPSILON_START = 1
 EPSILON_END = 0.1
 NUM_EPSILON_DECAY_STEPS = 500000
 
-BATCH_SIZE = 32
-LR = 2.5e-5
+BATCH_SIZE = 64
+LR = 2.5e-4
 GAMMA = 0.99
 
 UPDATE_POLICY_FREQUENCY = 4
@@ -282,8 +282,8 @@ def preprocess_transitions(transitions_batch):
 
     # rewards:
     # - from from list[float] of shape (B) 
-    # - to clipped value torch.tensor[torch.int8] of shape (B)
-    rewards = torch.tensor(np.sign(np.array(rewards)), dtype=torch.int8)
+    # - to clipped value torch.tensor[torch.float32] of shape (B)
+    rewards = torch.tensor(np.array(rewards), dtype=torch.float32)
 
     # actions:
     # - from from list[int] of shape (B) 
