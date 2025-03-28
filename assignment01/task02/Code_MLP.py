@@ -338,7 +338,7 @@ def main():
     agent, training_history = train_agent(agent, env, verbose=True)
     env.close()
 
-    with open('ddqn_agent_checkpoint.pkl', 'wb') as f:
+    with open('ddqn_agent_checkpoint_mlp.pkl', 'wb') as f:
         pickle.dump(agent, f)
 
     plot_history(
@@ -347,7 +347,7 @@ def main():
         title='History of Reward per Episode for DDQN Agent', 
         xlabel='Episodes Played', 
         ylabel='Reward', 
-        fig_path='reward_per_ep_plot.jpg',
+        fig_path='reward_per_ep_plot_mlp.jpg',
     )
 
     plot_history(
@@ -356,11 +356,11 @@ def main():
         title='History of Steps per Episode for DDQN Agent', 
         xlabel='Episodes Played', 
         ylabel='Number of Steps', 
-        fig_path='steps_per_ep_plot.jpg',
+        fig_path='steps_per_ep_plot_mlp.jpg',
     )
 
     video_env = make_environment(render_mode="rgb_array")
-    video_env = RecordVideo(video_env, video_folder='.', name_prefix='Video', episode_trigger=lambda _: True)
+    video_env = RecordVideo(video_env, video_folder='.', name_prefix='Video-MLP', episode_trigger=lambda _: True)
     record_agent_playing(agent, video_env)
     video_env.close()
 
