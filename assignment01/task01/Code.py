@@ -10,6 +10,7 @@ import ale_py
 import random
 import pickle
 import signal 
+import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -340,7 +341,15 @@ def main():
 
     signal.signal(signal.SIGINT, stop_training)
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    if len(sys.argv) > 1:
+        device = sys.argv[1]
+
+    device = torch.device(
+        sys.argv[1] if len(sys.argv) > 1 else
+        "mps" if torch.backends.mps.is_available() else
+        "cuda" if torch.cuda.is_available() else
+        "cpu"
+    )
     agent = DQNAgent(device)
 
     env = make_environment()
